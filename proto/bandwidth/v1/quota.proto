@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package bandwidth.v1;
+
+option go_package = "github.com/antonk/bandwidth-quota-service/proto/bandwidth/v1;bandwidthv1";
+
+// BandwidthQuotaService backs Envoy's distributed_token_bucket lease fetcher.
+// It hosts the canonical token-bucket math behind a stable gRPC API so Envoy
+// only needs a generic gRPC client; the storage backend (Redis today) is an
+// implementation detail of this service.
+service BandwidthQuotaService {
+  // AcquireLease issues a partial-grant lease. The caller asks for up to
+  // `requested_tokens`; the service returns however many tokens were available
+  // (in [0, requested_tokens]). Callers are expected to consume the granted
+  // amount locally before the next call.
+  //
+  // Buckets are keyed by `key`. Two callers using the same key against the
+  // same backend share one global rate.
+  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+}
+
+message AcquireLeaseRequest {
+  // Bucket key. Convention: scope/tenant identifier with a direction suffix
+  // (e.g. "tenant.acme.bandwidth:read"). Required.
+  string key = 1;
+
+  // Maximum tokens the caller wants. The response will return at most this
+  // many. Required.
+  uint64 requested_tokens = 2;
+
+  // Bucket rate / capacity in tokens per second.
+  //
+  // The first caller to touch a key implicitly seeds the bucket with this
+  // rate; subsequent calls supplying a different rate are honored only on a
+  // best-effort basis (the service may emit a `rate_mismatch` stat). To
+  // change the rate of an existing bucket, use the admin API or delete the
+  // key out-of-band.
+  //
+  // Required.
+  uint64 rate_tokens_per_sec = 3;
+}
+
+message AcquireLeaseResponse {
+  // Tokens granted to the caller. May be less than `requested_tokens` if the
+  // bucket was partially full; may be 0 if it was empty.
+  uint64 granted_tokens = 1;
+
+  // Hint indicating roughly how long the caller should wait before the next
+  // request if `granted_tokens == 0`. Optional; clients may ignore.
+  uint64 retry_after_ms = 2;
+}

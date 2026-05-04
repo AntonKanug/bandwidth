@@ -1,0 +1,69 @@
+# Envoy B: TCP listener on :9001, admin on :9902.
+# Pair with envoy-bw-a.yaml (ports 9000/9901) to demonstrate the global limit
+# being shared across two Envoys via the bandwidth-quota gRPC service.
+
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9902 } }
+
+static_resources:
+  listeners:
+  - name: tcp_listener
+    address: { socket_address: { address: 0.0.0.0, port_value: 9001 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.tcp_bandwidth_limit
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_bandwidth_limit.v3.TcpBandwidthLimit
+          stat_prefix: bw
+          read_limit_kbps:  { value: 1024 }   # 1 MiB/s GLOBAL across all Envoys
+          write_limit_kbps: { value: 1024 }
+          fill_interval: 0.05s
+          distributed:
+            quota_service:
+              envoy_grpc:
+                cluster_name: bandwidth_quota
+            key: tenant.acme.bandwidth
+            fail_open: false
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: tcp
+          cluster: upstream
+
+  clusters:
+  - name: bandwidth_quota
+    connect_timeout: 1s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    # Bound the in-flight queue. A brief network glitch will surface as
+    # AcquireLease deadline-exceeded; without these the pending queue grows
+    # unbounded under load. Tune to your fleet's expected lease QPS.
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 16
+        max_pending_requests: 64
+        max_requests: 256
+        max_retries: 3
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: bandwidth_quota
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address: { socket_address: { address: 127.0.0.1, port_value: 9300 } }
+
+  - name: upstream
+    connect_timeout: 1s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: upstream
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address: { socket_address: { address: 127.0.0.1, port_value: 8000 } }
