@@ -1,0 +1,11 @@
+Quota service: {{ include "bandwidth-quota.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+Redis backend: {{ include "bandwidth-quota.redisAddress" . }}
+
+Configure each Envoy's quota cluster to use the service above with HTTP/2.
+Envoys sharing a budget must use the same distributed key and directional rate.
+This chart deploys the quota service and optional Redis; Envoy configuration
+is supplied separately. See demo/kind for the static Envoy example.
+{{- if and .Values.redis.enabled (not .Values.redis.persistence.enabled) }}
+
+Redis uses ephemeral storage. Enable redis.persistence.enabled for a PVC.
+{{- end }}

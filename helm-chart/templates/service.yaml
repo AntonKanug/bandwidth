@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bandwidth-quota.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "bandwidth-quota.labels" . | nindent 4 }}
+    app.kubernetes.io/component: quota
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.port }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: kubernetes.io/h2c
+  selector:
+    {{- include "bandwidth-quota.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: quota

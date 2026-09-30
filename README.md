@@ -8,6 +8,9 @@ For the static Envoy demo in the dedicated `bandwidth-testing` kind cluster,
 see [demo/kind/README.md](demo/kind/README.md). It measures one, two and three
 Envoys sharing the same TCP bandwidth budget, plus fail-closed recovery.
 
+The [Helm chart](helm-chart/README.md) deploys the quota service with bundled
+Redis, optional persistent storage, or an external Redis endpoint.
+
 ## API
 
 ```proto

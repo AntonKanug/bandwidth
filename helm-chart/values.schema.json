@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "image": {"$ref": "#/definitions/image"},
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {"name": {"type": "string", "minLength": 1}}
+      }
+    },
+    "nameOverride": {"$ref": "#/definitions/name"},
+    "fullnameOverride": {"$ref": "#/definitions/name"},
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "service": {
+      "type": "object",
+      "required": ["type", "port"],
+      "properties": {
+        "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+        "port": {"$ref": "#/definitions/port"}
+      },
+      "additionalProperties": false
+    },
+    "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "resources": {"type": "object"},
+    "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+    "tolerations": {"type": "array", "items": {"type": "object"}},
+    "affinity": {"type": "object"},
+    "redis": {
+      "type": "object",
+      "required": ["enabled", "image", "port", "persistence"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "image": {"$ref": "#/definitions/image"},
+        "port": {"$ref": "#/definitions/port"},
+        "persistence": {
+          "type": "object",
+          "required": ["enabled", "size", "storageClass", "existingClaim"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "size": {"type": "string", "minLength": 1},
+            "storageClass": {"type": "string"},
+            "existingClaim": {"type": "string"}
+          },
+          "if": {"properties": {"existingClaim": {"minLength": 1}}},
+          "then": {"properties": {"enabled": {"const": true}}},
+          "additionalProperties": false
+        },
+        "resources": {"type": "object"},
+        "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tolerations": {"type": "array", "items": {"type": "object"}},
+        "affinity": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "externalRedis": {
+      "type": "object",
+      "required": ["address"],
+      "properties": {"address": {"type": "string"}},
+      "additionalProperties": false
+    }
+  },
+  "if": {"properties": {"redis": {"properties": {"enabled": {"const": false}}}}},
+  "then": {
+    "properties": {
+      "externalRedis": {
+        "properties": {"address": {"minLength": 1, "pattern": "^[^\\s]+:[0-9]+$"}}
+      }
+    }
+  },
+  "definitions": {
+    "name": {
+      "type": "string",
+      "maxLength": 54,
+      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+    },
+    "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}

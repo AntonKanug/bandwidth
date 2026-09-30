@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bandwidth-quota.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "bandwidth-quota.labels" . | nindent 4 }}
+    app.kubernetes.io/component: quota
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "bandwidth-quota.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: quota
+  template:
+    metadata:
+      labels:
+        {{- include "bandwidth-quota.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: quota
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: quota
+          image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - {{ printf "--listen=:%v" .Values.service.port | quote }}
+            - {{ printf "--redis-addr=%s" (include "bandwidth-quota.redisAddress" .) | quote }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            grpc:
+              port: {{ .Values.service.port }}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            grpc:
+              port: {{ .Values.service.port }}
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: {{ .Values.service.port }}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
