@@ -1,0 +1,4 @@
+FROM python:3.12-alpine
+COPY traffic.py /app/traffic.py
+USER 65532:65532
+ENTRYPOINT ["python3", "-u", "/app/traffic.py"]

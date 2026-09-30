@@ -25,7 +25,9 @@ local data = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens = tonumber(data[1]) or rate
 local ts     = tonumber(data[2]) or now
 tokens = math.max(0, math.min(rate, tokens + (now - ts) * rate / 1000))
-local granted = math.min(req, tokens)
+-- Reserve only whole bytes. Deducting a fractional grant before rounding the
+-- response discards refill credit and can starve frequent low-rate callers.
+local granted = math.min(req, math.floor(tokens))
 tokens = tokens - granted
 redis.call('HSET', key, 'tokens', tokens, 'ts', now)
 redis.call('PEXPIRE', key, 60000)

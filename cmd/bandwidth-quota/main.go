@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
-	bandwidthv1 "github.com/antonk/bandwidth-quota-service/gen/go/bandwidth/v1"
 	"github.com/antonk/bandwidth-quota-service/internal/server"
 )
 
@@ -32,7 +31,7 @@ func main() {
 	srv := server.NewRedisServer(*redisAddr)
 
 	gs := grpc.NewServer()
-	bandwidthv1.RegisterBandwidthQuotaServiceServer(gs, srv)
+	server.Register(gs, srv)
 	healthpb.RegisterHealthServer(gs, health.NewServer())
 
 	go func() {

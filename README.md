@@ -4,6 +4,10 @@ Small gRPC service that backs Envoy's distributed bandwidth limit. Hosts the
 authoritative token-bucket math behind a stable gRPC API; storage backend is
 Redis (managed via Lua for atomicity).
 
+For the static Envoy demo in the dedicated `bandwidth-testing` kind cluster,
+see [demo/kind/README.md](demo/kind/README.md). It measures one, two and three
+Envoys sharing the same TCP bandwidth budget, plus fail-closed recovery.
+
 ## API
 
 ```proto
@@ -13,6 +17,9 @@ service BandwidthQuotaService {
 ```
 
 See `proto/bandwidth/v1/quota.proto` for the full schema.
+The server also registers the wire-compatible service name
+`envoy.extensions.distributed_token_bucket.v3.BandwidthQuotaService` used by the
+experimental Envoy branch, whose protobuf package differs from this service's.
 
 ## Build and run locally
 
@@ -76,8 +83,11 @@ See the Envoy fork's docs:
 
 ## Operational sizing
 
-- One bucket key in Redis is ~100 bytes. A million buckets is ~100 MB.
-- Steady-state Redis QPS per Envoy is roughly `rate_kbps / lease_kb`. With a
-  1 MiB/s rate and 64 KiB lease, that's ~16 calls/sec/Envoy/bucket.
+- Each bucket stores a key, token balance and timestamp. Measure actual memory
+  with Redis `MEMORY USAGE`; key length, encoding and allocator overhead matter.
+- With full grants, fleet-wide acquisition QPS is roughly
+  `global_rate_kib_per_sec / lease_kib`: a shared 1 MiB/s rate and 64 KiB lease
+  needs about 16 full grants/sec/bucket. Empty and partial grants add requests;
+  actual QPS also depends on replica count and retry cadence.
 - The service itself is stateless; horizontal scaling is just spinning up
   more replicas behind your load balancer of choice.

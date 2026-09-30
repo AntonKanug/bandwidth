@@ -31,9 +31,9 @@ func newTestServer(t *testing.T) (*Server, *miniredis.Miniredis, func()) {
 func acquire(t *testing.T, srv *Server, key string, requested, rate uint64) *bandwidthv1.AcquireLeaseResponse {
 	t.Helper()
 	resp, err := srv.AcquireLease(context.Background(), &bandwidthv1.AcquireLeaseRequest{
-		Key:               key,
-		RequestedTokens:   requested,
-		RateTokensPerSec:  rate,
+		Key:              key,
+		RequestedTokens:  requested,
+		RateTokensPerSec: rate,
 	})
 	if err != nil {
 		t.Fatalf("AcquireLease: %v", err)
@@ -185,15 +185,39 @@ func TestSharedKeyContendsCorrectly(t *testing.T) {
 func TestNoScriptRecovery(t *testing.T) {
 	srv, mr, cleanup := newTestServer(t)
 	defer cleanup()
+	mr.SetTime(time.Unix(1700000000, 0))
 
 	_ = acquire(t, srv, "k1", 500, 1000)
 
-	// Simulate Redis evicting the script: clear all loaded scripts.
-	mr.FlushAll()
+	// FLUSHALL removes data, not the script cache. Evict the script while
+	// preserving this half-empty bucket so the EVAL fallback is exercised.
+	if err := srv.scripter.(*redis.Client).ScriptFlush(context.Background()).Err(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Next call should recover via EVAL fallback.
-	r := acquire(t, srv, "k1", 500, 1000)
-	if r.GrantedTokens == 0 {
-		t.Fatalf("granted=0 after script eviction; expected recovery via EVAL")
+	r := acquire(t, srv, "k1", 800, 1000)
+	if r.GrantedTokens != 500 {
+		t.Fatalf("granted=%d after script eviction, want remaining 500", r.GrantedTokens)
+	}
+}
+
+// Polling faster than a byte refills must not erase fractional credit.
+func TestFractionalRefillSurvivesEmptyGrants(t *testing.T) {
+	srv, mr, cleanup := newTestServer(t)
+	defer cleanup()
+	start := time.Unix(1700000000, 0)
+	mr.SetTime(start)
+	_ = acquire(t, srv, "fractional", 10, 10)
+	for i := 1; i <= 10; i++ {
+		mr.SetTime(start.Add(time.Duration(i) * 50 * time.Millisecond))
+		got := acquire(t, srv, "fractional", 10, 10).GrantedTokens
+		want := uint64(0)
+		if i%2 == 0 {
+			want = 1
+		}
+		if got != want {
+			t.Fatalf("poll %d: granted %d, want %d", i, got, want)
+		}
 	}
 }

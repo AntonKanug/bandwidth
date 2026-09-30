@@ -28,9 +28,8 @@ type Server struct {
 }
 
 // New builds a Server backed by `s`. The Lua script is registered with
-// go-redis' Script helper, which handles SCRIPT LOAD on first use, EVALSHA
-// thereafter, and transparent NOSCRIPT recovery — no manual SHA caching, no
-// permanent error caching.
+// go-redis' Script helper, which attempts EVALSHA and falls back to EVAL on
+// NOSCRIPT — no manual script loading or permanent error caching.
 func New(s Scripter) *Server {
 	return &Server{
 		scripter: s,
@@ -57,8 +56,8 @@ func (s *Server) AcquireLease(
 	keys := []string{req.GetKey()}
 	args := []interface{}{req.GetRateTokensPerSec(), req.GetRequestedTokens()}
 
-	// Run() does EVALSHA then falls back to EVAL on NOSCRIPT, automatically
-	// updating its cached hash on the way. No sticky error state.
+	// Run() does EVALSHA then falls back to EVAL on NOSCRIPT. Redis caches
+	// the script after EVAL, so subsequent EVALSHA calls can use it.
 	result, err := s.script.Run(ctx, s.scripter, keys, args...).Result()
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "redis eval failed: %v", err)

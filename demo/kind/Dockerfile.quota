@@ -1,0 +1,5 @@
+FROM scratch
+COPY .build/bandwidth-quota /bandwidth-quota
+USER 65532:65532
+EXPOSE 9300
+ENTRYPOINT ["/bandwidth-quota"]

@@ -1,0 +1,1865 @@
+diff --git a/api/envoy/extensions/filters/network/tcp_bandwidth_limit/v3/tcp_bandwidth_limit.proto b/api/envoy/extensions/filters/network/tcp_bandwidth_limit/v3/tcp_bandwidth_limit.proto
+index cc76ce0cc9..d4e483820e 100644
+--- a/api/envoy/extensions/filters/network/tcp_bandwidth_limit/v3/tcp_bandwidth_limit.proto
++++ b/api/envoy/extensions/filters/network/tcp_bandwidth_limit/v3/tcp_bandwidth_limit.proto
+@@ -3,6 +3,7 @@ syntax = "proto3";
+ package envoy.extensions.filters.network.tcp_bandwidth_limit.v3;
+ 
+ import "envoy/config/core/v3/base.proto";
++import "envoy/config/core/v3/grpc_service.proto";
+ 
+ import "google/protobuf/duration.proto";
+ import "google/protobuf/wrappers.proto";
+@@ -20,7 +21,61 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
+ // TCP Bandwidth Limit :ref:`configuration overview <config_network_filters_tcp_bandwidth_limit>`.
+ // [#extension: envoy.filters.network.tcp_bandwidth_limit]
+ 
++// Distributed (cross-process) bandwidth limit configuration. When set, the
++// filter uses a leased token bucket fetched from an external bandwidth-quota
++// gRPC service shared across multiple Envoy instances; the service owns the
++// authoritative bucket state and is the single source of truth for grants.
++// The ``read_limit_kbps`` / ``write_limit_kbps`` values are interpreted as
++// the global fleet-wide rate. ``fail_open_kbps`` controls per-instance
++// fallback behavior when the quota service is unreachable.
++//
++// Two filter chains pointing at the same ``key`` against the same
++// ``quota_service`` share one global rate. The filter automatically appends
++// ``:read`` and ``:write`` suffixes to ``key`` so the read and write
++// directions track independent global pools without colliding.
++//
+ // [#next-free-field: 6]
++message DistributedBandwidthLimit {
++  // gRPC service exposing the bandwidth quota API
++  // (``envoy.extensions.distributed_token_bucket.v3.BandwidthQuotaService``).
++  // The standalone ``bandwidth-quota`` Go binary implements this; any service
++  // that speaks the proto schema is acceptable.
++  config.core.v3.GrpcService quota_service = 1 [(validate.rules).message = {required: true}];
++
++  // Bucket key. Combined with the per-direction suffix described above to form
++  // the actual key in the remote store.
++  string key = 2 [(validate.rules).string = {min_len: 1}];
++
++  // Local lease size in KiB. Each refill from the quota service tops the
++  // local bucket back up toward this size. Larger leases reduce QPS but
++  // increase the worst-case over-allow when many instances refill in
++  // parallel. If unset, an automatic value is derived from the configured
++  // rate (~ ``rate * fill_interval``), clamped to [64 KiB, 16 MiB].
++  //
++  // Note: the *server-side* bucket capacity equals the configured rate, so a
++  // lease larger than ~1 second of rate is silently capped to that rate by
++  // the quota service. Setting ``lease_kb`` >> 1s of rate is wasteful.
++  google.protobuf.UInt64Value lease_kb = 3;
++
++  // If true, fall back to a local token bucket at ``fail_open_kbps`` (or, if
++  // that is unset, the configured global rate for the direction) when the
++  // quota service is unreachable. Defaults to ``false``: the safer choice for
++  // distributed semantics, since the alternative (true) lets every Envoy
++  // independently allow up to the global rate during a service outage.
++  bool fail_open = 4;
++
++  // Per-instance bandwidth in KiB/s used while the quota service is
++  // unreachable and ``fail_open`` is true. Has no effect if ``fail_open`` is
++  // false. If unset, the fallback rate defaults to the configured
++  // ``read_limit_kbps`` / ``write_limit_kbps`` per instance — which means an
++  // outage allows the configured global rate *per Envoy*. With N Envoys this
++  // is N× the intended global rate during the outage. **Set this explicitly
++  // to a fraction of the global rate (e.g. global / expected_fleet_size) if
++  // you turn ``fail_open`` on.**
++  google.protobuf.UInt32Value fail_open_kbps = 5;
++}
++
++// [#next-free-field: 7]
+ message TcpBandwidthLimit {
+   // The human readable prefix to use when emitting stats.
+   string stat_prefix = 1 [(validate.rules).string = {min_len: 1}];
+@@ -45,4 +100,11 @@ message TcpBandwidthLimit {
+   // Runtime flag that controls whether the filter is enabled or not. If not specified, defaults
+   // to enabled.
+   config.core.v3.RuntimeFeatureFlag runtime_enabled = 5;
++
++  // When set, the read / write limits are enforced via a remote leased token
++  // bucket (typically Redis-backed) shared across multiple Envoy instances.
++  // ``read_limit_kbps`` / ``write_limit_kbps`` are interpreted as the global
++  // rate. Unless ``fail_open_kbps`` is set, this is also the per-instance
++  // fallback rate when ``fail_open`` is enabled.
++  DistributedBandwidthLimit distributed = 6;
+ }
+diff --git a/docs/root/configuration/listeners/network_filters/tcp_bandwidth_limit_filter.rst b/docs/root/configuration/listeners/network_filters/tcp_bandwidth_limit_filter.rst
+index 7008f26b1e..82e9336c2d 100644
+--- a/docs/root/configuration/listeners/network_filters/tcp_bandwidth_limit_filter.rst
++++ b/docs/root/configuration/listeners/network_filters/tcp_bandwidth_limit_filter.rst
+@@ -38,6 +38,89 @@ The following example configuration limits read bandwidth to 1 MiB/s and write b
+     fill_interval:
+       nanos: 50000000       # 50ms
+ 
++Distributed mode
++----------------
++
++By default each Envoy enforces ``read_limit_kbps`` / ``write_limit_kbps``
++independently in-process: with ``N`` Envoys you get ``N`` × the limit aggregate.
++To share a single limit across all instances, set the
++:ref:`distributed <envoy_v3_api_field_extensions.filters.network.tcp_bandwidth_limit.v3.TcpBandwidthLimit.distributed>`
++field. The filter then enforces the limit via a leased token bucket fetched
++from an external **bandwidth quota gRPC service** shared across the fleet.
++
++The service is a small standalone gRPC server implementing
++``envoy.extensions.distributed_token_bucket.v3.BandwidthQuotaService.AcquireLease``;
++the reference implementation backs the bucket with Redis. Envoy itself does
++not speak to Redis directly — it talks gRPC to the service, the service talks
++Redis. This matches the same shape as the rate-limit, ext-authz and ext-proc
++data-plane callouts and inherits Envoy's standard gRPC client features (mTLS,
++retries, outlier detection, cluster pooling).
++
++How it works:
++
++* Each Envoy keeps a small **local lease** of tokens. Reads/writes draw from
++  this lease synchronously inside the worker thread.
++* When the local lease drops below a threshold an asynchronous ``AcquireLease``
++  RPC is dispatched against the configured
++  :ref:`quota_service <envoy_v3_api_field_extensions.filters.network.tcp_bandwidth_limit.v3.DistributedBandwidthLimit.quota_service>`.
++  The service atomically advances the global bucket and returns the granted
++  token count.
++* Read and write directions automatically use **different bucket keys**: the
++  ``key`` you configure is suffixed with ``:read`` and ``:write`` so the two
++  directions track independent global pools and never collide on a single
++  global counter.
++* If
++  :ref:`lease_kb <envoy_v3_api_field_extensions.filters.network.tcp_bandwidth_limit.v3.DistributedBandwidthLimit.lease_kb>`
++  is unset, an automatic value is derived from the configured rate (~ one
++  ``fill_interval``'s worth of bandwidth) and clamped to ``[64 KiB, 16 MiB]``.
++* If the quota service is unreachable and
++  :ref:`fail_open <envoy_v3_api_field_extensions.filters.network.tcp_bandwidth_limit.v3.DistributedBandwidthLimit.fail_open>`
++  is ``true``, each Envoy falls back to a local-only token bucket at
++  :ref:`fail_open_kbps <envoy_v3_api_field_extensions.filters.network.tcp_bandwidth_limit.v3.DistributedBandwidthLimit.fail_open_kbps>`
++  per instance. If ``fail_open_kbps`` is unset, the configured global rate
++  for that direction becomes the per-instance fallback rate.
++  ``fail_open`` defaults to ``false`` (the safer choice for
++  distributed semantics — when ``true``, an outage allows N × the configured
++  fallback rate until recovery).
++
++The bucket is approximate: with ``N`` instances and lease size ``L`` the total
++delivery may exceed the global limit by up to ``N`` × ``L`` during refill bursts.
++Smaller leases narrow the window at the cost of higher service QPS.
++
++Example: 1 MiB/s shared across all Envoys keyed by tenant:
++
++.. code-block:: yaml
++
++  name: envoy.filters.network.tcp_bandwidth_limit
++  typed_config:
++    "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_bandwidth_limit.v3.TcpBandwidthLimit
++    stat_prefix: bandwidth_limiter
++    read_limit_kbps: 1024   # 1 MiB/s GLOBAL
++    write_limit_kbps: 1024
++    distributed:
++      quota_service:
++        envoy_grpc:
++          cluster_name: bandwidth_quota_cluster
++      key: tenant.acme.bandwidth
++      fail_open: false
++
++The ``quota_service`` is a standard
++:ref:`GrpcService <envoy_v3_api_msg_config.core.v3.GrpcService>` reference, so
++mTLS, retries and any other transport-socket / cluster configuration are owned
++by the cluster.
++
++In addition to the regular per-direction stats, distributed mode emits a set
++of stats under ``<stat_prefix>.distributed_bandwidth_limit.``:
++
++.. csv-table::
++  :header: Name, Type, Description
++  :widths: 1, 1, 2
++
++  lease_requests_total, Counter, Number of AcquireLease calls dispatched
++  lease_failures_total, Counter, Number of AcquireLease calls that failed (transport error or non-OK status)
++  lease_granted_bytes_total, Counter, Sum of granted_tokens across successful calls
++  fail_open_active, Gauge, 1 while the bucket is operating in fail-open fallback, 0 otherwise
++
+ Statistics
+ ----------
+ 
+diff --git a/docs/root/intro/arch_overview/other_features/bandwidth_limiting.rst b/docs/root/intro/arch_overview/other_features/bandwidth_limiting.rst
+index ee822256cc..b7cb2ec375 100644
+--- a/docs/root/intro/arch_overview/other_features/bandwidth_limiting.rst
++++ b/docs/root/intro/arch_overview/other_features/bandwidth_limiting.rst
+@@ -12,3 +12,7 @@ Envoy supports local (non-distributed) bandwidth fair-sharing of HTTP requests a
+ globally at the listener level or at a more specific level (e.g.: the virtual host or route level).
+ Bandwidth fair sharing is distinct from bandwidth limiting in that one limit can be weighted split
+ between tenants when overloaded.
++
++Envoy supports local and distributed TCP bandwidth limiting through the
++:ref:`TCP bandwidth limit filter <config_network_filters_tcp_bandwidth_limit>`. Distributed limits
++share byte leases from an external quota service across Envoy instances.
+diff --git a/source/extensions/filters/network/tcp_bandwidth_limit/BUILD b/source/extensions/filters/network/tcp_bandwidth_limit/BUILD
+index 5b10b29129..4a6fc05b86 100644
+--- a/source/extensions/filters/network/tcp_bandwidth_limit/BUILD
++++ b/source/extensions/filters/network/tcp_bandwidth_limit/BUILD
+@@ -15,20 +15,29 @@ envoy_cc_library(
+     hdrs = ["tcp_bandwidth_limit.h"],
+     deps = [
+         "//envoy/buffer:buffer_interface",
++        "//envoy/common:exception_lib",
+         "//envoy/common:time_interface",
++        "//envoy/common:token_bucket_interface",
+         "//envoy/event:dispatcher_interface",
+         "//envoy/event:timer_interface",
++        "//envoy/grpc:async_client_manager_interface",
+         "//envoy/network:connection_interface",
+         "//envoy/network:filter_interface",
+         "//envoy/runtime:runtime_interface",
++        "//envoy/server:factory_context_interface",
+         "//envoy/stats:stats_interface",
+         "//envoy/stats:stats_macros",
+         "//source/common/buffer:buffer_lib",
+         "//source/common/buffer:watermark_buffer_lib",
+         "//source/common/common:assert_lib",
++        "//source/common/common:fmt_lib",
+         "//source/common/common:logger_lib",
+         "//source/common/common:shared_token_bucket_impl_lib",
++        "//source/common/grpc:typed_async_client_lib",
+         "//source/common/runtime:runtime_lib",
++        "//source/extensions/common/distributed_token_bucket:distributed_token_bucket_lib",
++        "//source/extensions/common/distributed_token_bucket:grpc_lease_fetcher_lib",
++        "@abseil-cpp//absl/strings",
+         "@envoy_api//envoy/extensions/filters/network/tcp_bandwidth_limit/v3:pkg_cc_proto",
+     ],
+ )
+diff --git a/source/extensions/filters/network/tcp_bandwidth_limit/config.cc b/source/extensions/filters/network/tcp_bandwidth_limit/config.cc
+index 7d00523ccb..95802145f7 100644
+--- a/source/extensions/filters/network/tcp_bandwidth_limit/config.cc
++++ b/source/extensions/filters/network/tcp_bandwidth_limit/config.cc
+@@ -15,9 +15,8 @@ Network::FilterFactoryCb TcpBandwidthLimitConfigFactory::createFilterFactoryFrom
+         proto_config,
+     Server::Configuration::FactoryContext& context) {
+ 
+-  auto config = std::make_shared<FilterConfig>(proto_config, context.scope(),
+-                                               context.serverFactoryContext().runtime(),
+-                                               context.serverFactoryContext().timeSource());
++  auto config =
++      std::make_shared<FilterConfig>(proto_config, context.scope(), context.serverFactoryContext());
+ 
+   return [config](Network::FilterManager& filter_manager) -> void {
+     filter_manager.addFilter(std::make_shared<TcpBandwidthLimitFilter>(config));
+diff --git a/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.cc b/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.cc
+index a8f996bd8c..3139e07cac 100644
+--- a/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.cc
++++ b/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.cc
+@@ -1,10 +1,21 @@
+ #include "source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.h"
+ 
++#include <algorithm>
++
+ #include "envoy/buffer/buffer.h"
++#include "envoy/common/exception.h"
+ #include "envoy/event/dispatcher.h"
++#include "envoy/grpc/async_client_manager.h"
+ #include "envoy/network/connection.h"
+ 
+ #include "source/common/common/assert.h"
++#include "source/common/common/fmt.h"
++#include "source/common/common/shared_token_bucket_impl.h"
++#include "source/common/grpc/typed_async_client.h"
++#include "source/extensions/common/distributed_token_bucket/distributed_token_bucket.h"
++#include "source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.h"
++
++#include "absl/strings/str_cat.h"
+ 
+ namespace Envoy {
+ namespace Extensions {
+@@ -15,32 +26,107 @@ namespace {
+ constexpr uint64_t kiloBytesToBytes(uint64_t val) { return val * 1024; }
+ constexpr int64_t RateUpdateIntervalMs = 1000;
+ constexpr uint64_t MillisecondsPerSecond = 1000;
++constexpr uint64_t MinLeaseKb = 64;
++constexpr uint64_t MaxLeaseKb = 16 * 1024; // 16 MiB
++constexpr std::chrono::milliseconds QuotaRpcTimeout{500};
++
++// Auto-derive a sensible lease size when the operator hasn't picked one. Want
++// roughly one fill_interval's worth of bandwidth, clamped between MinLeaseKb
++// and MaxLeaseKb so we don't DoS the quota service at small rates and don't
++// over-allow at huge ones.
++uint64_t deriveLeaseKb(uint64_t rate_kbps, uint64_t fill_interval_ms) {
++  const uint64_t target_kb = rate_kbps * fill_interval_ms / 1000;
++  return std::min(MaxLeaseKb, std::max(MinLeaseKb, target_kb));
++}
++
++std::shared_ptr<TokenBucket> makeBucket(
++    bool has_limit, uint64_t limit_kbps, uint64_t fill_interval_ms, absl::string_view direction,
++    const envoy::extensions::filters::network::tcp_bandwidth_limit::v3::TcpBandwidthLimit& proto,
++    Server::Configuration::ServerFactoryContext& server_ctx, Stats::Scope& scope,
++    Common::DistributedTokenBucket::DistributedBucketStats* stats) {
++  if (!has_limit) {
++    return nullptr;
++  }
++  const uint64_t rate_bps = kiloBytesToBytes(limit_kbps);
++
++  if (!proto.has_distributed()) {
++    return std::make_shared<SharedTokenBucketImpl>(rate_bps, server_ctx.timeSource(),
++                                                   static_cast<double>(rate_bps));
++  }
++
++  const auto& dist = proto.distributed();
++  const uint64_t lease_kb =
++      dist.has_lease_kb() ? dist.lease_kb().value() : deriveLeaseKb(limit_kbps, fill_interval_ms);
++  const uint64_t lease_size = kiloBytesToBytes(lease_kb);
++  // B2: per-instance fail-open rate. If the operator did not pick a value,
++  // default to the configured global rate divided by 1 — i.e. *no* implicit
++  // de-rating, matching the operationally-safe-but-conservative choice that
++  // ``fail_open`` itself defaults to false.
++  const uint64_t fail_open_rate_kbps =
++      dist.has_fail_open_kbps() ? dist.fail_open_kbps().value() : limit_kbps;
++
++  Common::DistributedTokenBucket::DistributedTokenBucketConfig dt_config{
++      /*lease_size=*/lease_size,
++      /*low_watermark=*/lease_size / 4,
++      /*fail_open_rate_tokens_per_sec=*/kiloBytesToBytes(fail_open_rate_kbps),
++      /*fail_open=*/dist.fail_open(),
++      /*retry_interval=*/std::chrono::milliseconds(1000),
++      /*stats=*/stats,
++  };
++
++  // Build a typed gRPC client for the configured quota service.
++  Grpc::GrpcServiceConfigWithHashKey config_with_hash_key(dist.quota_service());
++  auto client_or =
++      server_ctx.clusterManager().grpcAsyncClientManager().getOrCreateRawAsyncClientWithHashKey(
++          config_with_hash_key, scope, true);
++  if (!client_or.ok()) {
++    throw EnvoyException(
++        fmt::format("tcp_bandwidth_limit: distributed mode quota_service is misconfigured: {}",
++                    client_or.status().message()));
++  }
++
++  // B1: separate read and write keys to prevent the two directions sharing a
++  // single global pool by accident.
++  std::string suffixed_key = absl::StrCat(dist.key(), ":", direction);
++
++  auto fetcher = std::make_unique<Common::DistributedTokenBucket::GrpcLeaseFetcher>(
++      client_or.value(), QuotaRpcTimeout, std::move(suffixed_key), rate_bps,
++      server_ctx.mainThreadDispatcher());
++
++  return std::make_shared<Common::DistributedTokenBucket::DistributedTokenBucket>(
++      dt_config, std::move(fetcher), server_ctx.timeSource());
++}
+ 
+ } // namespace
+ 
+ FilterConfig::FilterConfig(
+     const envoy::extensions::filters::network::tcp_bandwidth_limit::v3::TcpBandwidthLimit& config,
+-    Stats::Scope& scope, Runtime::Loader& runtime, TimeSource& time_source)
+-    : runtime_(runtime), time_source_(time_source),
++    Stats::Scope& scope, Server::Configuration::ServerFactoryContext& server_ctx)
++    : runtime_(server_ctx.runtime()), time_source_(server_ctx.timeSource()),
+       read_limit_kbps_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, read_limit_kbps, 0)),
+       write_limit_kbps_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, write_limit_kbps, 0)),
+       fill_interval_(std::chrono::milliseconds(
+           PROTOBUF_GET_MS_OR_DEFAULT(config, fill_interval, 50))), // Default 50ms
+-      enabled_(config.runtime_enabled(), runtime),
++      enabled_(config.runtime_enabled(), server_ctx.runtime()),
+       stats_(generateStats(config.stat_prefix(), scope)),
++      distributed_stats_(
++          config.has_distributed()
++              ? std::make_unique<
++                    Extensions::Common::DistributedTokenBucket::DistributedBucketStats>(
++                    Extensions::Common::DistributedTokenBucket::generateDistributedBucketStats(
++                        config.stat_prefix(), scope))
++              : nullptr),
+       // The token bucket is configured with a max token count of the number of
+       // bytes per second, and refills at the same rate, so that we have a per
+-      // second limit which refills gradually over the fill interval.
+-      read_token_bucket_(config.has_read_limit_kbps()
+-                             ? std::make_shared<SharedTokenBucketImpl>(
+-                                   kiloBytesToBytes(read_limit_kbps_), time_source_,
+-                                   static_cast<double>(kiloBytesToBytes(read_limit_kbps_)))
+-                             : nullptr),
+-      write_token_bucket_(config.has_write_limit_kbps()
+-                              ? std::make_shared<SharedTokenBucketImpl>(
+-                                    kiloBytesToBytes(write_limit_kbps_), time_source_,
+-                                    static_cast<double>(kiloBytesToBytes(write_limit_kbps_)))
+-                              : nullptr) {}
++      // second limit which refills gradually over the fill interval. When the
++      // proto sets ``distributed``, the bucket is replaced with a remote-leased
++      // implementation sharing state across processes.
++      read_token_bucket_(makeBucket(config.has_read_limit_kbps(), read_limit_kbps_,
++                                    fill_interval_.count(), "read", config, server_ctx, scope,
++                                    distributed_stats_.get())),
++      write_token_bucket_(makeBucket(config.has_write_limit_kbps(), write_limit_kbps_,
++                                     fill_interval_.count(), "write", config, server_ctx, scope,
++                                     distributed_stats_.get())) {}
+ 
+ TcpBandwidthLimitStats FilterConfig::generateStats(const std::string& prefix, Stats::Scope& scope) {
+   const std::string final_prefix = prefix + ".tcp_bandwidth_limit";
+diff --git a/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.h b/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.h
+index 60344c5b32..c069a308eb 100644
+--- a/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.h
++++ b/source/extensions/filters/network/tcp_bandwidth_limit/tcp_bandwidth_limit.h
+@@ -4,17 +4,19 @@
+ #include <memory>
+ 
+ #include "envoy/common/time.h"
++#include "envoy/common/token_bucket.h"
+ #include "envoy/event/timer.h"
+ #include "envoy/extensions/filters/network/tcp_bandwidth_limit/v3/tcp_bandwidth_limit.pb.h"
+ #include "envoy/network/filter.h"
+ #include "envoy/runtime/runtime.h"
++#include "envoy/server/factory_context.h"
+ #include "envoy/stats/scope.h"
+ #include "envoy/stats/stats_macros.h"
+ 
+ #include "source/common/buffer/watermark_buffer.h"
+ #include "source/common/common/logger.h"
+-#include "source/common/common/shared_token_bucket_impl.h"
+ #include "source/common/runtime/runtime_protos.h"
++#include "source/extensions/common/distributed_token_bucket/distributed_token_bucket.h"
+ 
+ namespace Envoy {
+ namespace Extensions {
+@@ -50,7 +52,7 @@ class FilterConfig {
+ public:
+   FilterConfig(
+       const envoy::extensions::filters::network::tcp_bandwidth_limit::v3::TcpBandwidthLimit& config,
+-      Stats::Scope& scope, Runtime::Loader& runtime, TimeSource& time_source);
++      Stats::Scope& scope, Server::Configuration::ServerFactoryContext& server_ctx);
+ 
+   Runtime::Loader& runtime() { return runtime_; }
+   TcpBandwidthLimitStats& stats() { return stats_; }
+@@ -61,12 +63,8 @@ public:
+   uint64_t readLimit() const { return read_limit_kbps_; }
+   uint64_t writeLimit() const { return write_limit_kbps_; }
+   bool enabled() const { return enabled_.enabled(); }
+-  const std::shared_ptr<SharedTokenBucketImpl>& readTokenBucket() const {
+-    return read_token_bucket_;
+-  }
+-  const std::shared_ptr<SharedTokenBucketImpl>& writeTokenBucket() const {
+-    return write_token_bucket_;
+-  }
++  const std::shared_ptr<TokenBucket>& readTokenBucket() const { return read_token_bucket_; }
++  const std::shared_ptr<TokenBucket>& writeTokenBucket() const { return write_token_bucket_; }
+   std::chrono::milliseconds fillInterval() const { return fill_interval_; }
+ 
+ private:
+@@ -79,8 +77,12 @@ private:
+   const std::chrono::milliseconds fill_interval_;
+   const Runtime::FeatureFlag enabled_;
+   TcpBandwidthLimitStats stats_;
+-  std::shared_ptr<SharedTokenBucketImpl> read_token_bucket_;
+-  std::shared_ptr<SharedTokenBucketImpl> write_token_bucket_;
++  // Distributed-mode stats. Allocated lazily only when proto.has_distributed()
++  // so the stat namespace stays clean for purely-local configs.
++  std::unique_ptr<Extensions::Common::DistributedTokenBucket::DistributedBucketStats>
++      distributed_stats_;
++  std::shared_ptr<TokenBucket> read_token_bucket_;
++  std::shared_ptr<TokenBucket> write_token_bucket_;
+ };
+ 
+ using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
+diff --git a/test/extensions/filters/network/tcp_bandwidth_limit/BUILD b/test/extensions/filters/network/tcp_bandwidth_limit/BUILD
+index 5da3e200cd..55d5622651 100644
+--- a/test/extensions/filters/network/tcp_bandwidth_limit/BUILD
++++ b/test/extensions/filters/network/tcp_bandwidth_limit/BUILD
+@@ -20,6 +20,8 @@ envoy_cc_test(
+         "//test/mocks/event:event_mocks",
+         "//test/mocks/network:network_mocks",
+         "//test/mocks/runtime:runtime_mocks",
++        "//test/mocks/server:factory_context_mocks",
++        "//test/mocks/upstream:cluster_manager_mocks",
+         "//test/test_common:simulated_time_system_lib",
+         "//test/test_common:utility_lib",
+     ],
+diff --git a/test/extensions/filters/network/tcp_bandwidth_limit/filter_test.cc b/test/extensions/filters/network/tcp_bandwidth_limit/filter_test.cc
+index bb9dc04bae..3d3fc967d4 100644
+--- a/test/extensions/filters/network/tcp_bandwidth_limit/filter_test.cc
++++ b/test/extensions/filters/network/tcp_bandwidth_limit/filter_test.cc
+@@ -5,6 +5,8 @@
+ #include "test/mocks/event/mocks.h"
+ #include "test/mocks/network/mocks.h"
+ #include "test/mocks/runtime/mocks.h"
++#include "test/mocks/server/factory_context.h"
++#include "test/mocks/upstream/cluster_manager.h"
+ #include "test/test_common/simulated_time_system.h"
+ #include "test/test_common/utility.h"
+ 
+@@ -32,8 +34,8 @@ public:
+     envoy::extensions::filters::network::tcp_bandwidth_limit::v3::TcpBandwidthLimit proto_config;
+     TestUtility::loadFromYaml(yaml, proto_config);
+ 
+-    config_ = std::make_shared<FilterConfig>(proto_config, *stats_store_.rootScope(), runtime_,
+-                                             time_source_);
++    config_ = std::make_shared<FilterConfig>(proto_config, *stats_store_.rootScope(),
++                                             server_factory_context_);
+     filter_ = std::make_unique<TcpBandwidthLimitFilter>(config_);
+ 
+     // Set a buffer limit so the WatermarkBuffer watermarks are active.
+@@ -46,6 +48,7 @@ public:
+   NiceMock<Runtime::MockLoader> runtime_;
+   Stats::IsolatedStoreImpl stats_store_;
+   Event::SimulatedTimeSystem time_source_;
++  NiceMock<Server::Configuration::MockServerFactoryContext> server_factory_context_;
+   NiceMock<Network::MockReadFilterCallbacks> read_filter_callbacks_;
+   NiceMock<Network::MockWriteFilterCallbacks> write_filter_callbacks_;
+   FilterConfigSharedPtr config_;
+@@ -277,7 +280,7 @@ TEST_F(TcpBandwidthLimitFilterTest, FillIntervalValidation) {
+   FilterConfigSharedPtr config2 = std::make_shared<FilterConfig>(
+       TestUtility::parseYaml<
+           envoy::extensions::filters::network::tcp_bandwidth_limit::v3::TcpBandwidthLimit>(yaml2),
+-      *stats_store_.rootScope(), runtime_, time_source_);
++      *stats_store_.rootScope(), server_factory_context_);
+   EXPECT_EQ(std::chrono::milliseconds(1000), config2->fillInterval());
+ }
+ 
+@@ -371,8 +374,8 @@ TEST_F(TcpBandwidthLimitFilterTest, ConfigAccessors) {
+   EXPECT_EQ(std::chrono::milliseconds(100), config_->fillInterval());
+   EXPECT_TRUE(config_->enabled());
+ 
+-  EXPECT_EQ(&runtime_, &config_->runtime());
+-  EXPECT_EQ(&time_source_, &config_->timeSource());
++  EXPECT_EQ(&server_factory_context_.runtime_loader_, &config_->runtime());
++  EXPECT_EQ(&server_factory_context_.time_system_, &config_->timeSource());
+ 
+   const std::string yaml_no_limits = R"EOF(
+     stat_prefix: test
+diff --git a/api/envoy/extensions/distributed_token_bucket/v3/BUILD b/api/envoy/extensions/distributed_token_bucket/v3/BUILD
+new file mode 100644
+index 0000000000..022e7e34ca
+--- /dev/null
++++ b/api/envoy/extensions/distributed_token_bucket/v3/BUILD
+@@ -0,0 +1,9 @@
++load("@envoy_api//bazel:api_build_system.bzl", "api_proto_package")
++
++licenses(["notice"])  # Apache 2
++
++api_proto_package(
++    deps = [
++        "@xds//udpa/annotations:pkg",
++    ],
++)
+diff --git a/api/envoy/extensions/distributed_token_bucket/v3/quota.proto b/api/envoy/extensions/distributed_token_bucket/v3/quota.proto
+new file mode 100644
+index 0000000000..4a3aaa1902
+--- /dev/null
++++ b/api/envoy/extensions/distributed_token_bucket/v3/quota.proto
+@@ -0,0 +1,48 @@
++syntax = "proto3";
++
++package envoy.extensions.distributed_token_bucket.v3;
++
++import "udpa/annotations/status.proto";
++import "validate/validate.proto";
++
++option java_package = "io.envoyproxy.envoy.extensions.distributed_token_bucket.v3";
++option java_outer_classname = "QuotaProto";
++option java_multiple_files = true;
++option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/distributed_token_bucket/v3;distributed_token_bucketv3";
++option (udpa.annotations.file_status).package_version_status = ACTIVE;
++
++// [#protodoc-title: Bandwidth Quota Service]
++
++// gRPC API consumed by Envoy's distributed token-bucket bandwidth limiter.
++// The on-the-wire equivalent of this service in the Envoy fork is the
++// out-of-tree ``bandwidth-quota`` Go binary; the source of truth for the
++// schema lives there. This file mirrors that schema so the C++ filter can
++// link a generated client.
++service BandwidthQuotaService {
++  // AcquireLease issues a partial-grant lease against a named bucket key.
++  // Callers ask for up to ``requested_tokens``; the response returns however
++  // many were actually available (in [0, requested_tokens]).
++  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse) {
++  }
++}
++
++message AcquireLeaseRequest {
++  // Bucket key. Convention: scope/tenant identifier with a direction suffix
++  // (e.g. "tenant.acme.bandwidth:read"). Required.
++  string key = 1 [(validate.rules).string = {min_len: 1}];
++
++  // Maximum tokens the caller wants. Required.
++  uint64 requested_tokens = 2;
++
++  // Bucket rate / capacity in tokens per second. Required.
++  uint64 rate_tokens_per_sec = 3 [(validate.rules).uint64 = {gt: 0}];
++}
++
++message AcquireLeaseResponse {
++  // Tokens granted to the caller. May be less than ``requested_tokens``.
++  uint64 granted_tokens = 1;
++
++  // Hint for how long to wait before the next request when ``granted_tokens``
++  // is 0. Optional.
++  uint64 retry_after_ms = 2;
++}
+diff --git a/changelogs/current/new_features/tcp_bandwidth_limit__distributed.rst b/changelogs/current/new_features/tcp_bandwidth_limit__distributed.rst
+new file mode 100644
+index 0000000000..7fb0c6f90b
+--- /dev/null
++++ b/changelogs/current/new_features/tcp_bandwidth_limit__distributed.rst
+@@ -0,0 +1 @@
++tcp_bandwidth_limit: added optional distributed bandwidth limits backed by byte leases from a gRPC quota service.
+diff --git a/source/extensions/common/distributed_token_bucket/BUILD b/source/extensions/common/distributed_token_bucket/BUILD
+new file mode 100644
+index 0000000000..bf6047dd92
+--- /dev/null
++++ b/source/extensions/common/distributed_token_bucket/BUILD
+@@ -0,0 +1,52 @@
++load(
++    "//bazel:envoy_build_system.bzl",
++    "envoy_cc_library",
++    "envoy_package",
++)
++
++licenses(["notice"])  # Apache 2
++
++envoy_package()
++
++envoy_cc_library(
++    name = "lease_fetcher_interface",
++    hdrs = ["lease_fetcher.h"],
++    deps = [
++        "//envoy/common:pure_lib",
++    ],
++)
++
++envoy_cc_library(
++    name = "distributed_token_bucket_lib",
++    srcs = ["distributed_token_bucket.cc"],
++    hdrs = ["distributed_token_bucket.h"],
++    deps = [
++        ":lease_fetcher_interface",
++        "//envoy/common:time_interface",
++        "//envoy/common:token_bucket_interface",
++        "//envoy/stats:scope_interface",
++        "//envoy/stats:stats_interface",
++        "//envoy/stats:stats_macros",
++        "//source/common/common:assert_lib",
++        "//source/common/common:minimal_logger_lib",
++        "//source/common/common:token_bucket_impl_lib",
++        "@abseil-cpp//absl/synchronization",
++    ],
++)
++
++envoy_cc_library(
++    name = "grpc_lease_fetcher_lib",
++    srcs = ["grpc_lease_fetcher.cc"],
++    hdrs = ["grpc_lease_fetcher.h"],
++    deps = [
++        ":lease_fetcher_interface",
++        "//envoy/event:dispatcher_interface",
++        "//envoy/grpc:async_client_interface",
++        "//envoy/tracing:tracer_interface",
++        "//source/common/common:assert_lib",
++        "//source/common/common:minimal_logger_lib",
++        "//source/common/grpc:typed_async_client_lib",
++        "//source/common/tracing:null_span_lib",
++        "@envoy_api//envoy/extensions/distributed_token_bucket/v3:pkg_cc_proto",
++    ],
++)
+diff --git a/source/extensions/common/distributed_token_bucket/distributed_token_bucket.cc b/source/extensions/common/distributed_token_bucket/distributed_token_bucket.cc
+new file mode 100644
+index 0000000000..2c10193b5a
+--- /dev/null
++++ b/source/extensions/common/distributed_token_bucket/distributed_token_bucket.cc
+@@ -0,0 +1,197 @@
++#include "source/extensions/common/distributed_token_bucket/distributed_token_bucket.h"
++
++#include <algorithm>
++
++#include "source/common/common/assert.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++
++DistributedBucketStats generateDistributedBucketStats(const std::string& prefix,
++                                                      Stats::Scope& scope) {
++  const std::string final_prefix = prefix + ".distributed_bandwidth_limit";
++  return {ALL_DISTRIBUTED_BUCKET_STATS(POOL_COUNTER_PREFIX(scope, final_prefix),
++                                       POOL_GAUGE_PREFIX(scope, final_prefix))};
++}
++
++DistributedTokenBucket::DistributedTokenBucket(DistributedTokenBucketConfig config,
++                                               LeaseFetcherPtr fetcher, TimeSource& time_source)
++    : config_(config), fetcher_(std::move(fetcher)), time_source_(time_source) {}
++
++DistributedTokenBucket::~DistributedTokenBucket() {
++  // Tear the fetcher down first so any in-flight remote requests are cancelled
++  // by its destructor before we mark ourselves dead.
++  alive_->store(false);
++}
++
++uint64_t DistributedTokenBucket::consume(uint64_t tokens, bool allow_partial) {
++  std::chrono::milliseconds unused;
++  return consume(tokens, allow_partial, unused);
++}
++
++uint64_t DistributedTokenBucket::consume(uint64_t tokens, bool allow_partial,
++                                         std::chrono::milliseconds& time_to_next_token) {
++  bool kick_off_fetch = false;
++  uint64_t requested_lease = 0;
++
++  uint64_t consumed = 0;
++  {
++    absl::MutexLock lock(&mutex_);
++
++    if (fail_open_active_) {
++      // Operating from the fallback bucket. consume() draws from it directly.
++      ASSERT(fail_open_bucket_ != nullptr);
++      consumed = fail_open_bucket_->consume(tokens, allow_partial, time_to_next_token);
++
++      // Periodically retry the remote source. Without setting requested_lease
++      // here the retry would ask for 0 tokens — which the remote happily
++      // grants — and the bucket would exit fail-open with an empty local
++      // lease, stalling the next consume.
++      const auto now = time_source_.monotonicTime();
++      if (!refill_in_flight_ && now >= next_refill_time_) {
++        refill_in_flight_ = true;
++        kick_off_fetch = true;
++        requested_lease = config_.lease_size;
++      }
++    } else {
++      // Normal mode: serve from the local lease.
++      if (local_tokens_ >= tokens) {
++        local_tokens_ -= tokens;
++        consumed = tokens;
++        time_to_next_token =
++            local_tokens_ > 0 ? std::chrono::milliseconds(0) : config_.retry_interval;
++      } else if (allow_partial) {
++        consumed = local_tokens_;
++        local_tokens_ = 0;
++        // Without a fresh lease the next token will arrive when the fetch
++        // completes. We don't know precisely when; report the retry interval
++        // as a coarse upper bound.
++        time_to_next_token = config_.retry_interval;
++      } else {
++        consumed = 0;
++        time_to_next_token = config_.retry_interval;
++      }
++
++      if (shouldRequestRefillLocked()) {
++        refill_in_flight_ = true;
++        kick_off_fetch = true;
++        requested_lease = (config_.lease_size > local_tokens_) ? config_.lease_size - local_tokens_
++                                                               : config_.lease_size;
++      }
++    }
++  }
++
++  if (kick_off_fetch) {
++    if (config_.stats != nullptr) {
++      config_.stats->lease_requests_total_.inc();
++    }
++    auto alive = alive_;
++    fetcher_->fetchLease(requested_lease, [this, alive](uint64_t granted, bool success) {
++      if (!alive->load(std::memory_order_acquire)) {
++        return;
++      }
++      onLeaseGranted(granted, success);
++    });
++  }
++
++  return consumed;
++}
++
++bool DistributedTokenBucket::shouldRequestRefillLocked() {
++  if (refill_in_flight_ || time_source_.monotonicTime() < next_refill_time_) {
++    return false;
++  }
++  return local_tokens_ < config_.low_watermark;
++}
++
++void DistributedTokenBucket::onLeaseGranted(uint64_t granted, bool success) {
++  absl::MutexLock lock(&mutex_);
++  refill_in_flight_ = false;
++
++  if (success) {
++    if (config_.stats != nullptr) {
++      config_.stats->lease_granted_bytes_total_.add(granted);
++    }
++    // A healthy zero grant means the global bucket is exhausted. Stop local
++    // fallback immediately so it cannot bypass the recovered global limit.
++    if (fail_open_active_) {
++      ENVOY_LOG(info, "distributed_token_bucket: remote recovered, leaving fail-open mode");
++      fail_open_active_ = false;
++      if (config_.stats != nullptr) {
++        config_.stats->fail_open_active_.set(0);
++      }
++      // Drop the fallback bucket; the lease is the source of truth again.
++      fail_open_bucket_.reset();
++    }
++    local_tokens_ = std::min(config_.lease_size, local_tokens_ + granted);
++    return;
++  }
++
++  // Fetch failed.
++  next_refill_time_ = time_source_.monotonicTime() + config_.retry_interval;
++  if (config_.stats != nullptr) {
++    config_.stats->lease_failures_total_.inc();
++  }
++
++  if (!config_.fail_open) {
++    ENVOY_LOG(warn, "distributed_token_bucket: remote unavailable, fail-closed");
++    return;
++  }
++
++  if (!fail_open_active_) {
++    ENVOY_LOG(warn, "distributed_token_bucket: remote unavailable, entering fail-open mode at "
++                    "configured rate");
++    fail_open_active_ = true;
++    if (config_.stats != nullptr) {
++      config_.stats->fail_open_active_.set(1);
++    }
++    if (fail_open_bucket_ == nullptr) {
++      fail_open_bucket_ = std::make_unique<TokenBucketImpl>(
++          config_.fail_open_rate_tokens_per_sec, time_source_,
++          static_cast<double>(config_.fail_open_rate_tokens_per_sec));
++    }
++  }
++}
++
++std::chrono::milliseconds DistributedTokenBucket::nextTokenAvailable() {
++  absl::MutexLock lock(&mutex_);
++  if (fail_open_active_ && fail_open_bucket_ != nullptr) {
++    return fail_open_bucket_->nextTokenAvailable();
++  }
++  if (local_tokens_ > 0) {
++    return std::chrono::milliseconds(0);
++  }
++  return config_.retry_interval;
++}
++
++void DistributedTokenBucket::maybeReset(uint64_t num_tokens) {
++  // The TokenBucket interface contract is to *set* the local count to
++  // `num_tokens`. The remote bucket's state is unchanged; the next refill will
++  // reconcile with whatever the remote side believes. Pre-fill semantics
++  // (callers that maybeReset to seed an initial burst before traffic flows)
++  // now work correctly.
++  absl::MutexLock lock(&mutex_);
++  local_tokens_ = num_tokens;
++}
++
++bool DistributedTokenBucket::refillInFlightForTest() const {
++  absl::MutexLock lock(&mutex_);
++  return refill_in_flight_;
++}
++
++bool DistributedTokenBucket::failOpenActiveForTest() const {
++  absl::MutexLock lock(&mutex_);
++  return fail_open_active_;
++}
++
++uint64_t DistributedTokenBucket::localLeaseForTest() const {
++  absl::MutexLock lock(&mutex_);
++  return local_tokens_;
++}
++
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/source/extensions/common/distributed_token_bucket/distributed_token_bucket.h b/source/extensions/common/distributed_token_bucket/distributed_token_bucket.h
+new file mode 100644
+index 0000000000..45909f6c8a
+--- /dev/null
++++ b/source/extensions/common/distributed_token_bucket/distributed_token_bucket.h
+@@ -0,0 +1,127 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <memory>
++
++#include "envoy/common/time.h"
++#include "envoy/common/token_bucket.h"
++#include "envoy/stats/scope.h"
++#include "envoy/stats/stats_macros.h"
++
++#include "source/common/common/logger.h"
++#include "source/common/common/token_bucket_impl.h"
++#include "source/extensions/common/distributed_token_bucket/lease_fetcher.h"
++
++#include "absl/synchronization/mutex.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++
++#define ALL_DISTRIBUTED_BUCKET_STATS(COUNTER, GAUGE)                                               \
++  COUNTER(lease_requests_total)                                                                    \
++  COUNTER(lease_failures_total)                                                                    \
++  COUNTER(lease_granted_bytes_total)                                                               \
++  GAUGE(fail_open_active, NeverImport)
++
++struct DistributedBucketStats {
++  ALL_DISTRIBUTED_BUCKET_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
++};
++
++// Build a stats struct rooted at "<prefix>.distributed_bandwidth_limit.*" in
++// `scope`. Filters call this once per FilterConfig and pass the returned struct
++// to `DistributedTokenBucketConfig::stats`.
++DistributedBucketStats generateDistributedBucketStats(const std::string& prefix,
++                                                      Stats::Scope& scope);
++
++struct DistributedTokenBucketConfig {
++  // Target lease size (bucket capacity in tokens). Each successful fetch tops
++  // the local lease back up toward this value.
++  uint64_t lease_size{};
++
++  // Refetch when the local lease drops below this threshold. Should be < lease_size.
++  uint64_t low_watermark{};
++
++  // Configured per-instance fill rate in tokens per second. Used as the
++  // fallback rate when `fail_open` is true and the remote bucket is unreachable.
++  uint64_t fail_open_rate_tokens_per_sec{};
++
++  // If true, fall back to a local TokenBucket at `fail_open_rate_tokens_per_sec`
++  // when the remote source is unavailable. If false, return 0 from consume()
++  // until the remote recovers (callers will buffer / backpressure).
++  bool fail_open{true};
++
++  // After a fetch failure, retry on the next consume() at most this often.
++  std::chrono::milliseconds retry_interval{std::chrono::seconds(1)};
++
++  // Optional stats sink. When non-null, the bucket emits counters/gauges for
++  // remote-fetch volume, failures, and fail-open state. Owned by the caller
++  // (typically the filter's FilterConfig); must outlive the bucket.
++  DistributedBucketStats* stats{nullptr};
++};
++
++// A TokenBucket implementation backed by a remote global counter, accessed
++// via `LeaseFetcher`. The remote storage backend is opaque to this class —
++// today's production fetcher is a gRPC client to a quota service that holds
++// state in Redis.
++//
++// Design: a small local lease holds tokens drawn from the global pool. consume()
++// is synchronous against the local lease. When the local lease drops below
++// `low_watermark` and no fetch is in flight, fetchLease() is dispatched
++// asynchronously; the granted tokens top up the local lease when the callback
++// fires.
++//
++// On fetch failure: if `fail_open`, switch to a local-only TokenBucket at the
++// configured fail-open rate. Periodically retry the remote on subsequent
++// consume() calls; the next successful fetch exits fail-open mode.
++//
++// Thread safety: all state is guarded by an internal mutex. consume() may be
++// called from any thread; the LeaseFetcher callback may fire on any thread.
++class DistributedTokenBucket : public TokenBucket, Logger::Loggable<Logger::Id::filter> {
++public:
++  DistributedTokenBucket(DistributedTokenBucketConfig config, LeaseFetcherPtr fetcher,
++                         TimeSource& time_source);
++  ~DistributedTokenBucket() override;
++
++  // TokenBucket
++  uint64_t consume(uint64_t tokens, bool allow_partial) override;
++  uint64_t consume(uint64_t tokens, bool allow_partial,
++                   std::chrono::milliseconds& time_to_next_token) override;
++  std::chrono::milliseconds nextTokenAvailable() override;
++  void maybeReset(uint64_t num_tokens) override;
++
++  // Test / observability hooks.
++  bool refillInFlightForTest() const;
++  bool failOpenActiveForTest() const;
++  uint64_t localLeaseForTest() const;
++
++private:
++  // Returns true if a refill should be requested now. Caller must invoke
++  // fetcher_->fetchLease() outside the lock.
++  bool shouldRequestRefillLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
++
++  void onLeaseGranted(uint64_t granted, bool success);
++
++  const DistributedTokenBucketConfig config_;
++  const LeaseFetcherPtr fetcher_;
++  TimeSource& time_source_;
++  // Set to false in the destructor; lease-callback lambdas check this before
++  // touching `this` so a late callback after destruction is a no-op.
++  const std::shared_ptr<std::atomic<bool>> alive_{std::make_shared<std::atomic<bool>>(true)};
++
++  mutable absl::Mutex mutex_;
++  uint64_t local_tokens_ ABSL_GUARDED_BY(mutex_){0};
++  bool refill_in_flight_ ABSL_GUARDED_BY(mutex_){false};
++  bool fail_open_active_ ABSL_GUARDED_BY(mutex_){false};
++  MonotonicTime next_refill_time_ ABSL_GUARDED_BY(mutex_){MonotonicTime::min()};
++  // Allocated lazily the first time we enter fail-open mode.
++  std::unique_ptr<TokenBucketImpl> fail_open_bucket_ ABSL_GUARDED_BY(mutex_);
++};
++
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.cc b/source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.cc
+new file mode 100644
+index 0000000000..86d92ca860
+--- /dev/null
++++ b/source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.cc
+@@ -0,0 +1,110 @@
++#include "source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.h"
++
++#include <utility>
++
++#include "source/common/common/assert.h"
++#include "source/common/tracing/null_span_impl.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++
++namespace {
++const char* kAcquireLeaseMethod =
++    "envoy.extensions.distributed_token_bucket.v3.BandwidthQuotaService.AcquireLease";
++}
++
++GrpcLeaseFetcher::GrpcLeaseFetcher(Grpc::RawAsyncClientSharedPtr grpc_client,
++                                   std::chrono::milliseconds timeout, std::string key,
++                                   uint64_t rate_tokens_per_sec, Event::Dispatcher& dispatcher)
++    : async_client_(std::move(grpc_client)),
++      service_method_(
++          *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(kAcquireLeaseMethod)),
++      timeout_(timeout), key_(std::move(key)), rate_tokens_per_sec_(rate_tokens_per_sec),
++      dispatcher_(dispatcher) {}
++
++GrpcLeaseFetcher::~GrpcLeaseFetcher() {
++  alive_->store(false);
++  // The underlying AsyncClient is dispatcher-thread-only; this destructor
++  // must run on the dispatcher thread or the fetcher's caller must arrange
++  // for cancellation prior to teardown. Cancel any in-flight request so its
++  // callback doesn't fire after we're gone.
++  if (request_ != nullptr) {
++    request_->cancel();
++    request_ = nullptr;
++  }
++}
++
++void GrpcLeaseFetcher::fetchLease(uint64_t requested, Callback cb) {
++  // Marshal onto the bound dispatcher. The gRPC client is not thread-safe.
++  auto alive = alive_;
++  dispatcher_.post([this, alive, requested, cb = std::move(cb)]() mutable {
++    if (!alive->load(std::memory_order_acquire)) {
++      cb(0, false);
++      return;
++    }
++    doFetch(requested, std::move(cb));
++  });
++}
++
++void GrpcLeaseFetcher::doFetch(uint64_t requested, Callback cb) {
++  ASSERT(dispatcher_.isThreadSafe());
++
++  if (current_callback_) {
++    // Caller didn't coalesce; reject the duplicate immediately so we don't
++    // grow an unbounded queue.
++    cb(0, false);
++    return;
++  }
++
++  envoy::extensions::distributed_token_bucket::v3::AcquireLeaseRequest request;
++  request.set_key(key_);
++  request.set_requested_tokens(requested);
++  request.set_rate_tokens_per_sec(rate_tokens_per_sec_);
++
++  current_callback_ = std::move(cb);
++  Http::AsyncClient::RequestOptions options;
++  options.setTimeout(timeout_);
++
++  request_ =
++      async_client_->send(service_method_, request, *this, Tracing::NullSpan::instance(), options);
++  if (request_ == nullptr) {
++    // send() may have invoked onFailure inline (in which case current_callback_
++    // is already cleared) or failed silently (in which case we clear it here).
++    if (current_callback_) {
++      ENVOY_LOG(debug, "grpc_lease_fetcher: send() returned null without invoking onFailure");
++      completeAndReset(0, false);
++    }
++  }
++}
++
++void GrpcLeaseFetcher::onSuccess(
++    Grpc::ResponsePtr<envoy::extensions::distributed_token_bucket::v3::AcquireLeaseResponse>&&
++        response,
++    Tracing::Span&) {
++  request_ = nullptr;
++  const uint64_t granted = response ? response->granted_tokens() : 0;
++  completeAndReset(granted, true);
++}
++
++void GrpcLeaseFetcher::onFailure(Grpc::Status::GrpcStatus status, const std::string& message,
++                                 Tracing::Span&) {
++  request_ = nullptr;
++  ENVOY_LOG(debug, "grpc_lease_fetcher: AcquireLease failed status={} message={}",
++            static_cast<int>(status), message);
++  completeAndReset(0, false);
++}
++
++void GrpcLeaseFetcher::completeAndReset(uint64_t granted, bool success) {
++  Callback cb = std::move(current_callback_);
++  current_callback_ = nullptr;
++  if (cb) {
++    cb(granted, success);
++  }
++}
++
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.h b/source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.h
+new file mode 100644
+index 0000000000..02808f1cae
+--- /dev/null
++++ b/source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.h
+@@ -0,0 +1,85 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include "envoy/event/dispatcher.h"
++#include "envoy/extensions/distributed_token_bucket/v3/quota.pb.h"
++#include "envoy/grpc/async_client.h"
++#include "envoy/tracing/tracer.h"
++
++#include "source/common/common/logger.h"
++#include "source/common/grpc/typed_async_client.h"
++#include "source/extensions/common/distributed_token_bucket/lease_fetcher.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++
++// LeaseFetcher backed by a unary gRPC call to the distributed token bucket
++// BandwidthQuotaService. Uses Envoy's standard gRPC
++// async-client infrastructure, so cluster pooling, mTLS, retries and outlier
++// detection come for free from the cluster the GrpcService config points at.
++//
++// Threading: the underlying RawAsyncClient is bound to a single dispatcher.
++// `fetchLease` may be called from any worker; it posts onto the bound
++// dispatcher and the gRPC call (and its callback) execute there. The bucket's
++// callback is invoked from the dispatcher thread; the bucket itself takes its
++// own mutex on the consume path so re-entry is safe.
++//
++// Concurrency: only one in-flight gRPC call per fetcher. If a second
++// fetchLease arrives before the first completes, the second is rejected
++// immediately (granted=0, success=false). The caller (DistributedTokenBucket)
++// already coalesces via its `refill_in_flight_` flag.
++class GrpcLeaseFetcher : public LeaseFetcher,
++                         public Grpc::AsyncRequestCallbacks<
++                             envoy::extensions::distributed_token_bucket::v3::AcquireLeaseResponse>,
++                         public Logger::Loggable<Logger::Id::filter> {
++public:
++  GrpcLeaseFetcher(Grpc::RawAsyncClientSharedPtr grpc_client, std::chrono::milliseconds timeout,
++                   std::string key, uint64_t rate_tokens_per_sec, Event::Dispatcher& dispatcher);
++  ~GrpcLeaseFetcher() override;
++
++  // LeaseFetcher
++  void fetchLease(uint64_t requested, Callback cb) override;
++
++  // Grpc::AsyncRequestCallbacks
++  void onCreateInitialMetadata(Http::RequestHeaderMap&) override {}
++  void onSuccess(
++      Grpc::ResponsePtr<envoy::extensions::distributed_token_bucket::v3::AcquireLeaseResponse>&&
++          response,
++      Tracing::Span&) override;
++  void onFailure(Grpc::Status::GrpcStatus status, const std::string& message,
++                 Tracing::Span&) override;
++
++private:
++  // Dispatcher-thread-only.
++  void doFetch(uint64_t requested, Callback cb);
++  void completeAndReset(uint64_t granted, bool success);
++
++  Grpc::AsyncClient<envoy::extensions::distributed_token_bucket::v3::AcquireLeaseRequest,
++                    envoy::extensions::distributed_token_bucket::v3::AcquireLeaseResponse>
++      async_client_;
++  const Protobuf::MethodDescriptor& service_method_;
++  const std::chrono::milliseconds timeout_;
++  const std::string key_;
++  const uint64_t rate_tokens_per_sec_;
++  Event::Dispatcher& dispatcher_;
++
++  // Dispatcher-thread state.
++  Grpc::AsyncRequest* request_{nullptr};
++  Callback current_callback_;
++
++  // Lifetime guard: lambdas posted to the dispatcher capture this and bail
++  // out if the fetcher has been destroyed before they run.
++  const std::shared_ptr<std::atomic<bool>> alive_{std::make_shared<std::atomic<bool>>(true)};
++};
++
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/source/extensions/common/distributed_token_bucket/lease_fetcher.h b/source/extensions/common/distributed_token_bucket/lease_fetcher.h
+new file mode 100644
+index 0000000000..c2d37f2e69
+--- /dev/null
++++ b/source/extensions/common/distributed_token_bucket/lease_fetcher.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <cstdint>
++#include <functional>
++#include <memory>
++
++#include "envoy/common/pure.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++
++class LeaseFetcher {
++public:
++  virtual ~LeaseFetcher() = default;
++
++  // Called once per fetch with the number of granted tokens. `success` is true
++  // if the remote source responded; false if the call failed (timeout, network
++  // error, missing cluster, etc.). On failure `granted` is 0.
++  using Callback = std::function<void(uint64_t granted, bool success)>;
++
++  // Asynchronously fetch up to `requested` tokens from the remote bucket.
++  // The implementation must invoke `cb` exactly once. Implementations are
++  // expected to be safe to call from any worker thread; the callback may
++  // fire on a different thread than the caller.
++  virtual void fetchLease(uint64_t requested, Callback cb) PURE;
++};
++
++using LeaseFetcherPtr = std::unique_ptr<LeaseFetcher>;
++
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/test/extensions/common/distributed_token_bucket/BUILD b/test/extensions/common/distributed_token_bucket/BUILD
+new file mode 100644
+index 0000000000..00aea2433d
+--- /dev/null
++++ b/test/extensions/common/distributed_token_bucket/BUILD
+@@ -0,0 +1,35 @@
++load(
++    "//bazel:envoy_build_system.bzl",
++    "envoy_cc_test",
++    "envoy_package",
++)
++
++licenses(["notice"])  # Apache 2
++
++envoy_package()
++
++envoy_cc_test(
++    name = "distributed_token_bucket_test",
++    srcs = ["distributed_token_bucket_test.cc"],
++    deps = [
++        "//source/common/stats:isolated_store_lib",
++        "//source/extensions/common/distributed_token_bucket:distributed_token_bucket_lib",
++        "//source/extensions/common/distributed_token_bucket:lease_fetcher_interface",
++        "//test/test_common:simulated_time_system_lib",
++    ],
++)
++
++envoy_cc_test(
++    name = "grpc_lease_fetcher_test",
++    srcs = ["grpc_lease_fetcher_test.cc"],
++    deps = [
++        "//source/common/buffer:buffer_lib",
++        "//source/common/grpc:common_lib",
++        "//source/common/tracing:null_span_lib",
++        "//source/extensions/common/distributed_token_bucket:grpc_lease_fetcher_lib",
++        "//source/extensions/common/distributed_token_bucket:lease_fetcher_interface",
++        "//test/mocks/event:event_mocks",
++        "//test/mocks/grpc:grpc_mocks",
++        "@envoy_api//envoy/extensions/distributed_token_bucket/v3:pkg_cc_proto",
++    ],
++)
+diff --git a/test/extensions/common/distributed_token_bucket/distributed_token_bucket_test.cc b/test/extensions/common/distributed_token_bucket/distributed_token_bucket_test.cc
+new file mode 100644
+index 0000000000..0b6f5c4974
+--- /dev/null
++++ b/test/extensions/common/distributed_token_bucket/distributed_token_bucket_test.cc
+@@ -0,0 +1,382 @@
++#include <chrono>
++#include <utility>
++#include <vector>
++
++#include "source/common/stats/isolated_store_impl.h"
++#include "source/extensions/common/distributed_token_bucket/distributed_token_bucket.h"
++#include "source/extensions/common/distributed_token_bucket/lease_fetcher.h"
++
++#include "test/test_common/simulated_time_system.h"
++
++#include "gtest/gtest.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++namespace {
++
++// A controllable LeaseFetcher: captures each call so the test can trigger
++// success/failure responses deterministically.
++class FakeLeaseFetcher : public LeaseFetcher {
++public:
++  struct PendingFetch {
++    uint64_t requested;
++    Callback cb;
++  };
++
++  void fetchLease(uint64_t requested, Callback cb) override {
++    pending_.push_back({requested, std::move(cb)});
++  }
++
++  void respondSuccess(uint64_t granted) {
++    ASSERT_FALSE(pending_.empty());
++    auto fetch = std::move(pending_.front());
++    pending_.erase(pending_.begin());
++    fetch.cb(granted, true);
++  }
++
++  void respondFailure() {
++    ASSERT_FALSE(pending_.empty());
++    auto fetch = std::move(pending_.front());
++    pending_.erase(pending_.begin());
++    fetch.cb(0, false);
++  }
++
++  size_t pendingCount() const { return pending_.size(); }
++  uint64_t lastRequested() const {
++    EXPECT_FALSE(pending_.empty());
++    return pending_.back().requested;
++  }
++
++private:
++  std::vector<PendingFetch> pending_;
++};
++
++class DistributedTokenBucketTest : public ::testing::Test {
++protected:
++  DistributedTokenBucketConfig defaultConfig() {
++    return {
++        /*lease_size=*/1000,
++        /*low_watermark=*/200,
++        /*fail_open_rate_tokens_per_sec=*/100,
++        /*fail_open=*/true,
++        /*retry_interval=*/std::chrono::milliseconds(100),
++        /*stats=*/nullptr,
++    };
++  }
++
++  std::unique_ptr<DistributedTokenBucket> makeBucket(DistributedTokenBucketConfig cfg) {
++    auto fetcher = std::make_unique<FakeLeaseFetcher>();
++    fetcher_ = fetcher.get();
++    return std::make_unique<DistributedTokenBucket>(cfg, std::move(fetcher), time_system_);
++  }
++
++  Event::SimulatedTimeSystem time_system_;
++  FakeLeaseFetcher* fetcher_{nullptr};
++};
++
++TEST_F(DistributedTokenBucketTest, EmptyLeaseTriggersFetchAndConsumesAfterGrant) {
++  auto bucket = makeBucket(defaultConfig());
++
++  // Local lease starts empty, so the first consume() with allow_partial returns 0
++  // and kicks off a fetch.
++  EXPECT_EQ(0, bucket->consume(500, true));
++  EXPECT_EQ(1, fetcher_->pendingCount());
++  EXPECT_TRUE(bucket->refillInFlightForTest());
++  EXPECT_EQ(1000, fetcher_->lastRequested());
++
++  fetcher_->respondSuccess(800);
++  EXPECT_FALSE(bucket->refillInFlightForTest());
++  EXPECT_EQ(800, bucket->localLeaseForTest());
++
++  EXPECT_EQ(500, bucket->consume(500, true));
++  EXPECT_EQ(300, bucket->localLeaseForTest());
++}
++
++TEST_F(DistributedTokenBucketTest, RefillFiresWhenBelowWatermark) {
++  auto bucket = makeBucket(defaultConfig());
++
++  // Prime the local lease above the watermark.
++  EXPECT_EQ(0, bucket->consume(0, true));
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondSuccess(1000);
++  ASSERT_EQ(1000, bucket->localLeaseForTest());
++
++  // Drain to just above the low_watermark (200). No refill expected.
++  EXPECT_EQ(700, bucket->consume(700, true));
++  EXPECT_EQ(0, fetcher_->pendingCount());
++
++  // Cross the watermark. Now a refill kicks off.
++  EXPECT_EQ(150, bucket->consume(150, true));
++  EXPECT_EQ(150, bucket->localLeaseForTest());
++  EXPECT_EQ(1, fetcher_->pendingCount());
++  // We requested headroom: lease_size - local_tokens_ = 1000 - 150 = 850.
++  EXPECT_EQ(850, fetcher_->lastRequested());
++}
++
++TEST_F(DistributedTokenBucketTest, AllowPartialReturnsPartial) {
++  auto bucket = makeBucket(defaultConfig());
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondSuccess(50);
++  ASSERT_EQ(50, bucket->localLeaseForTest());
++
++  // Asking for 200 with only 50 available, allow_partial=true, returns 50.
++  EXPECT_EQ(50, bucket->consume(200, true));
++  EXPECT_EQ(0, bucket->localLeaseForTest());
++}
++
++TEST_F(DistributedTokenBucketTest, NoPartialReturnsZeroWhenInsufficient) {
++  auto bucket = makeBucket(defaultConfig());
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondSuccess(50);
++  ASSERT_EQ(50, bucket->localLeaseForTest());
++
++  // Asking for 200 with only 50 available, allow_partial=false, returns 0
++  // without consuming.
++  EXPECT_EQ(0, bucket->consume(200, false));
++  EXPECT_EQ(50, bucket->localLeaseForTest());
++}
++
++TEST_F(DistributedTokenBucketTest, FailOpenEntersFallbackOnFailure) {
++  auto bucket = makeBucket(defaultConfig());
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondFailure();
++
++  EXPECT_TRUE(bucket->failOpenActiveForTest());
++
++  // Fallback bucket fills at 100 tokens/sec. Advancing 1s gives 100 tokens.
++  time_system_.advanceTimeWait(std::chrono::seconds(1));
++  EXPECT_EQ(100, bucket->consume(500, true));
++}
++
++TEST_F(DistributedTokenBucketTest, FailOpenRetriesAfterIntervalAndExitsOnSuccess) {
++  auto bucket = makeBucket(defaultConfig());
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondFailure();
++  ASSERT_TRUE(bucket->failOpenActiveForTest());
++
++  // Immediately calling consume again should NOT trigger a retry (within retry_interval).
++  bucket->consume(0, true);
++  EXPECT_EQ(0, fetcher_->pendingCount());
++
++  // Advance past the retry interval. Next consume kicks off a retry.
++  time_system_.advanceTimeWait(std::chrono::milliseconds(150));
++  bucket->consume(0, true);
++  EXPECT_EQ(1, fetcher_->pendingCount());
++
++  // B3 regression: the retry must request a real lease (lease_size), not 0.
++  // If it asked for 0, the next consume would stall with an empty local lease.
++  EXPECT_EQ(1000, fetcher_->lastRequested());
++
++  // Successful retry exits fail-open mode and tops up the lease.
++  fetcher_->respondSuccess(1000);
++  EXPECT_FALSE(bucket->failOpenActiveForTest());
++  EXPECT_EQ(1000, bucket->localLeaseForTest());
++}
++
++TEST_F(DistributedTokenBucketTest, FailClosedReturnsZeroOnFailure) {
++  auto cfg = defaultConfig();
++  cfg.fail_open = false;
++  auto bucket = makeBucket(cfg);
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondFailure();
++
++  EXPECT_FALSE(bucket->failOpenActiveForTest());
++  // No tokens available at all; consume returns 0.
++  EXPECT_EQ(0, bucket->consume(100, true));
++  EXPECT_EQ(0, bucket->consume(100, false));
++}
++
++TEST_F(DistributedTokenBucketTest, FailClosedRetriesOnlyAfterInterval) {
++  auto cfg = defaultConfig();
++  cfg.fail_open = false;
++  auto bucket = makeBucket(cfg);
++
++  bucket->consume(100, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondFailure();
++
++  // Repeated consume calls across connections must not bypass failure backoff.
++  EXPECT_EQ(0, bucket->consume(100, true));
++  EXPECT_EQ(0, bucket->consume(100, false));
++  EXPECT_EQ(0, fetcher_->pendingCount());
++  time_system_.advanceTimeWait(std::chrono::milliseconds(99));
++  EXPECT_EQ(0, bucket->consume(100, true));
++  EXPECT_EQ(0, fetcher_->pendingCount());
++
++  time_system_.advanceTimeWait(std::chrono::milliseconds(1));
++  EXPECT_EQ(0, bucket->consume(100, true));
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  EXPECT_EQ(1000, fetcher_->lastRequested());
++  fetcher_->respondFailure();
++
++  // Each failed retry starts a new interval.
++  EXPECT_EQ(0, bucket->consume(100, true));
++  EXPECT_EQ(0, fetcher_->pendingCount());
++  time_system_.advanceTimeWait(cfg.retry_interval);
++  EXPECT_EQ(0, bucket->consume(100, true));
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondSuccess(1000);
++
++  // Recovery restores normal refill behavior without an extra retry delay.
++  EXPECT_EQ(900, bucket->consume(900, true));
++  EXPECT_EQ(1, fetcher_->pendingCount());
++}
++
++TEST_F(DistributedTokenBucketTest, ConcurrentRequestsCoalesceIntoOneFetch) {
++  auto bucket = makeBucket(defaultConfig());
++
++  // First call kicks off a fetch.
++  bucket->consume(0, true);
++  EXPECT_EQ(1, fetcher_->pendingCount());
++
++  // Subsequent calls while the fetch is in flight do NOT issue more fetches.
++  bucket->consume(0, true);
++  bucket->consume(0, true);
++  EXPECT_EQ(1, fetcher_->pendingCount());
++
++  // After the response, a future drain below watermark issues a new fetch.
++  fetcher_->respondSuccess(1000);
++  EXPECT_EQ(900, bucket->consume(900, true));
++  EXPECT_EQ(1, fetcher_->pendingCount());
++}
++
++TEST_F(DistributedTokenBucketTest, GrantedTokensCappedAtLeaseSize) {
++  auto bucket = makeBucket(defaultConfig());
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  // Server "over-grants" beyond the lease capacity; bucket caps it at lease_size.
++  fetcher_->respondSuccess(5000);
++  EXPECT_EQ(1000, bucket->localLeaseForTest());
++}
++
++TEST_F(DistributedTokenBucketTest, ConsumeZeroAboveWatermarkDoesNotRefill) {
++  auto bucket = makeBucket(defaultConfig());
++
++  // Get the lease above the watermark.
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondSuccess(1000);
++  ASSERT_EQ(1000, bucket->localLeaseForTest());
++
++  // consume(0) above the watermark consumes nothing and triggers no fetch.
++  EXPECT_EQ(0, bucket->consume(0, true));
++  EXPECT_EQ(0, fetcher_->pendingCount());
++}
++
++TEST_F(DistributedTokenBucketTest, NextTokenAvailableReportsZeroWhenTokensPresent) {
++  auto bucket = makeBucket(defaultConfig());
++  bucket->consume(0, true);
++  fetcher_->respondSuccess(500);
++  EXPECT_EQ(std::chrono::milliseconds(0), bucket->nextTokenAvailable());
++}
++
++TEST_F(DistributedTokenBucketTest, NextTokenAvailableReportsRetryIntervalWhenEmpty) {
++  auto cfg = defaultConfig();
++  cfg.retry_interval = std::chrono::milliseconds(250);
++  auto bucket = makeBucket(cfg);
++  // No tokens, no successful fetch yet.
++  EXPECT_EQ(std::chrono::milliseconds(250), bucket->nextTokenAvailable());
++}
++
++// D9 regression: maybeReset must SET the local count, not clamp downward.
++TEST_F(DistributedTokenBucketTest, MaybeResetSetsLocalCount) {
++  auto bucket = makeBucket(defaultConfig());
++
++  bucket->consume(0, true);
++  fetcher_->respondSuccess(500);
++  ASSERT_EQ(500, bucket->localLeaseForTest());
++
++  // The old implementation clamped via std::min, so reset(900) would have left
++  // the count at 500. The contract is to *set* the count to 900.
++  bucket->maybeReset(900);
++  EXPECT_EQ(900, bucket->localLeaseForTest());
++
++  // And reset can also lower the count, as before.
++  bucket->maybeReset(100);
++  EXPECT_EQ(100, bucket->localLeaseForTest());
++}
++
++TEST_F(DistributedTokenBucketTest, FailOpenExitsOnHealthyZeroGrant) {
++  Stats::IsolatedStoreImpl store;
++  auto stats = generateDistributedBucketStats("bw", *store.rootScope());
++  auto cfg = defaultConfig();
++  cfg.stats = &stats;
++  auto bucket = makeBucket(cfg);
++
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondFailure();
++  ASSERT_TRUE(bucket->failOpenActiveForTest());
++  EXPECT_EQ(1, stats.fail_open_active_.value());
++
++  time_system_.advanceTimeWait(cfg.retry_interval);
++  bucket->consume(0, true);
++  ASSERT_EQ(1, fetcher_->pendingCount());
++  fetcher_->respondSuccess(0);
++
++  // The service is healthy but globally exhausted; fallback must stop.
++  EXPECT_FALSE(bucket->failOpenActiveForTest());
++  EXPECT_EQ(0, stats.fail_open_active_.value());
++  EXPECT_EQ(0, bucket->localLeaseForTest());
++  time_system_.advanceTimeWait(std::chrono::seconds(1));
++  EXPECT_EQ(0, bucket->consume(50, true));
++  ASSERT_EQ(1, fetcher_->pendingCount());
++
++  // Only a new grant can let traffic resume.
++  fetcher_->respondSuccess(500);
++  EXPECT_EQ(50, bucket->consume(50, true));
++  EXPECT_EQ(450, bucket->localLeaseForTest());
++}
++
++// D7: emit stats while the bucket is in use; verify counters move.
++TEST_F(DistributedTokenBucketTest, StatsTrackLeaseActivity) {
++  Stats::IsolatedStoreImpl store;
++  auto stats = generateDistributedBucketStats("bw", *store.rootScope());
++
++  auto cfg = defaultConfig();
++  cfg.stats = &stats;
++  auto bucket = makeBucket(cfg);
++
++  // First consume kicks a fetch.
++  bucket->consume(100, true);
++  EXPECT_EQ(1, stats.lease_requests_total_.value());
++  EXPECT_EQ(0, stats.lease_granted_bytes_total_.value());
++
++  // Successful fetch increments granted bytes.
++  fetcher_->respondSuccess(800);
++  EXPECT_EQ(800, stats.lease_granted_bytes_total_.value());
++  EXPECT_EQ(0, stats.lease_failures_total_.value());
++  EXPECT_EQ(0, stats.fail_open_active_.value());
++
++  // Drain below watermark to trigger another fetch, then fail it.
++  bucket->consume(700, true); // 800 - 700 = 100, below low_watermark=200
++  EXPECT_EQ(2, stats.lease_requests_total_.value());
++  fetcher_->respondFailure();
++  EXPECT_EQ(1, stats.lease_failures_total_.value());
++  EXPECT_EQ(1, stats.fail_open_active_.value());
++
++  // Recovery clears the gauge.
++  time_system_.advanceTimeWait(std::chrono::milliseconds(150));
++  bucket->consume(0, true);
++  fetcher_->respondSuccess(1000);
++  EXPECT_EQ(0, stats.fail_open_active_.value());
++}
++
++} // namespace
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/test/extensions/common/distributed_token_bucket/grpc_lease_fetcher_test.cc b/test/extensions/common/distributed_token_bucket/grpc_lease_fetcher_test.cc
+new file mode 100644
+index 0000000000..6662d34d04
+--- /dev/null
++++ b/test/extensions/common/distributed_token_bucket/grpc_lease_fetcher_test.cc
+@@ -0,0 +1,193 @@
++#include <chrono>
++#include <memory>
++#include <utility>
++
++#include "envoy/extensions/distributed_token_bucket/v3/quota.pb.h"
++
++#include "source/common/buffer/buffer_impl.h"
++#include "source/common/grpc/common.h"
++#include "source/common/tracing/null_span_impl.h"
++#include "source/extensions/common/distributed_token_bucket/grpc_lease_fetcher.h"
++#include "source/extensions/common/distributed_token_bucket/lease_fetcher.h"
++
++#include "test/mocks/event/mocks.h"
++#include "test/mocks/grpc/mocks.h"
++
++#include "gmock/gmock.h"
++#include "gtest/gtest.h"
++
++using ::testing::_;
++using ::testing::Invoke;
++using ::testing::NiceMock;
++using ::testing::Return;
++
++namespace Envoy {
++namespace Extensions {
++namespace Common {
++namespace DistributedTokenBucket {
++namespace {
++
++namespace QuotaProto = envoy::extensions::distributed_token_bucket::v3;
++
++class GrpcLeaseFetcherTest : public ::testing::Test {
++protected:
++  GrpcLeaseFetcherTest() {
++    // Run dispatcher.post() callbacks inline.
++    ON_CALL(dispatcher_, post(_)).WillByDefault(Invoke([](Event::PostCb cb) { cb(); }));
++    ON_CALL(dispatcher_, isThreadSafe()).WillByDefault(Return(true));
++  }
++
++  std::unique_ptr<GrpcLeaseFetcher> makeFetcher() {
++    auto raw_client = std::make_shared<NiceMock<Grpc::MockAsyncClient>>();
++    raw_client_ = raw_client.get();
++    return std::make_unique<GrpcLeaseFetcher>(std::move(raw_client), std::chrono::milliseconds(500),
++                                              "tenant.acme:read",
++                                              /*rate=*/1024 * 1024, dispatcher_);
++  }
++
++  // Build a buffer that, when parsed by the gRPC infrastructure, yields the
++  // given AcquireLeaseResponse.
++  Buffer::InstancePtr makeResponseBuffer(uint64_t granted_tokens, uint64_t retry_after_ms = 0) {
++    QuotaProto::AcquireLeaseResponse resp;
++    resp.set_granted_tokens(granted_tokens);
++    resp.set_retry_after_ms(retry_after_ms);
++    return Grpc::Common::serializeMessage(resp);
++  }
++
++  // The typed AsyncClient wrapper inserts itself between sendRaw and the
++  // user's onSuccess/onFailure. Capture the wrapper that gets handed to
++  // sendRaw so tests can drive it directly.
++  Grpc::RawAsyncRequestCallbacks* captureCallbacks(NiceMock<Grpc::MockAsyncRequest>& req) {
++    Grpc::RawAsyncRequestCallbacks* captured = nullptr;
++    EXPECT_CALL(*raw_client_, sendRaw(_, _, _, _, _, _))
++        .WillOnce(Invoke(
++            [&captured, &req](absl::string_view, absl::string_view, Buffer::InstancePtr&&,
++                              Grpc::RawAsyncRequestCallbacks& callbacks, Tracing::Span&,
++                              const Http::AsyncClient::RequestOptions&) -> Grpc::AsyncRequest* {
++              captured = &callbacks;
++              return &req;
++            }));
++    return captured;
++  }
++
++  NiceMock<Event::MockDispatcher> dispatcher_;
++  Grpc::MockAsyncClient* raw_client_{nullptr};
++};
++
++TEST_F(GrpcLeaseFetcherTest, FetchSuccessReturnsGrantedTokens) {
++  auto fetcher = makeFetcher();
++
++  NiceMock<Grpc::MockAsyncRequest> request;
++  Grpc::RawAsyncRequestCallbacks* captured = nullptr;
++  EXPECT_CALL(*raw_client_, sendRaw(_, _, _, _, _, _))
++      .WillOnce(Invoke(
++          [&captured, &request](absl::string_view, absl::string_view, Buffer::InstancePtr&&,
++                                Grpc::RawAsyncRequestCallbacks& callbacks, Tracing::Span&,
++                                const Http::AsyncClient::RequestOptions&) -> Grpc::AsyncRequest* {
++            captured = &callbacks;
++            return &request;
++          }));
++
++  uint64_t granted = 0;
++  bool ok = false;
++  fetcher->fetchLease(8192, [&](uint64_t g, bool s) {
++    granted = g;
++    ok = s;
++  });
++
++  ASSERT_NE(captured, nullptr);
++  // Hand the typed wrapper a serialized success response.
++  Tracing::NullSpan& span = Tracing::NullSpan::instance();
++  captured->onSuccessRaw(makeResponseBuffer(4096), span);
++
++  EXPECT_TRUE(ok);
++  EXPECT_EQ(4096, granted);
++}
++
++TEST_F(GrpcLeaseFetcherTest, FetchFailureIsReported) {
++  auto fetcher = makeFetcher();
++
++  NiceMock<Grpc::MockAsyncRequest> request;
++  Grpc::RawAsyncRequestCallbacks* captured = nullptr;
++  EXPECT_CALL(*raw_client_, sendRaw(_, _, _, _, _, _))
++      .WillOnce(Invoke(
++          [&captured, &request](absl::string_view, absl::string_view, Buffer::InstancePtr&&,
++                                Grpc::RawAsyncRequestCallbacks& callbacks, Tracing::Span&,
++                                const Http::AsyncClient::RequestOptions&) -> Grpc::AsyncRequest* {
++            captured = &callbacks;
++            return &request;
++          }));
++
++  uint64_t granted = 99;
++  bool ok = true;
++  fetcher->fetchLease(8192, [&](uint64_t g, bool s) {
++    granted = g;
++    ok = s;
++  });
++
++  ASSERT_NE(captured, nullptr);
++  Tracing::NullSpan& span = Tracing::NullSpan::instance();
++  captured->onFailure(Grpc::Status::WellKnownGrpcStatus::Unavailable, "service down", span);
++
++  EXPECT_FALSE(ok);
++  EXPECT_EQ(0, granted);
++}
++
++TEST_F(GrpcLeaseFetcherTest, ConcurrentFetchSecondRejectedImmediately) {
++  // Declare the mock request *before* the fetcher so it outlives the fetcher
++  // — the fetcher's destructor cancels in-flight requests, and we don't want
++  // to call cancel() on a destroyed mock.
++  NiceMock<Grpc::MockAsyncRequest> request;
++  EXPECT_CALL(request, cancel()).Times(::testing::AnyNumber());
++
++  auto fetcher = makeFetcher();
++  EXPECT_CALL(*raw_client_, sendRaw(_, _, _, _, _, _)).WillOnce(Return(&request));
++
++  bool first_done = false;
++  fetcher->fetchLease(8192, [&](uint64_t, bool) { first_done = true; });
++
++  // Second call while first is in flight is rejected without issuing a new
++  // gRPC request.
++  bool second_ok = true;
++  uint64_t second_granted = 99;
++  fetcher->fetchLease(8192, [&](uint64_t g, bool s) {
++    second_ok = s;
++    second_granted = g;
++  });
++  EXPECT_FALSE(second_ok);
++  EXPECT_EQ(0, second_granted);
++  EXPECT_FALSE(first_done);
++}
++
++TEST_F(GrpcLeaseFetcherTest, SendReturningNullIsTreatedAsFailure) {
++  auto fetcher = makeFetcher();
++
++  EXPECT_CALL(*raw_client_, sendRaw(_, _, _, _, _, _)).WillOnce(Return(nullptr));
++
++  uint64_t granted = 99;
++  bool ok = true;
++  fetcher->fetchLease(8192, [&](uint64_t g, bool s) {
++    granted = g;
++    ok = s;
++  });
++
++  EXPECT_FALSE(ok);
++  EXPECT_EQ(0, granted);
++}
++
++TEST_F(GrpcLeaseFetcherTest, DestructionCancelsInFlightRequest) {
++  auto fetcher = makeFetcher();
++
++  NiceMock<Grpc::MockAsyncRequest> request;
++  EXPECT_CALL(request, cancel());
++  EXPECT_CALL(*raw_client_, sendRaw(_, _, _, _, _, _)).WillOnce(Return(&request));
++
++  fetcher->fetchLease(8192, [](uint64_t, bool) {});
++  fetcher.reset();
++}
++
++} // namespace
++} // namespace DistributedTokenBucket
++} // namespace Common
++} // namespace Extensions
++} // namespace Envoy

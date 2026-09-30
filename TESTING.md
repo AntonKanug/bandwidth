@@ -1,4 +1,11 @@
-git remote add origin https://github.com/AntonKanug/bandwidth.git# End-to-end testing — bandwidth-quota service + Envoy
+# Historical local testing draft
+
+Use [the current kind demo](demo/kind/README.md) for the static-config experiment
+in `bandwidth-testing`, receiver-confirmed throughput measurements, and saved
+results. The instructions below predate the verified gRPC service-name adapter;
+their paths and assumptions are historical, not evidence that those checks ran.
+
+# End-to-end testing — bandwidth-quota service + Envoy
 
 This walks you from zero to a running fleet of two Envoys sharing a single
 bandwidth limit through the gRPC quota service. ~15 minutes once Envoy is
